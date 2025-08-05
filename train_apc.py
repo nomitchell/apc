@@ -170,7 +170,7 @@ def main(rank, world_size):
         transforms.ToTensor(),
         transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
     ])
-    trainset = torchvision.datasets.CIFAR10(root='./data', train=True, download=True, transform=transform_train)
+    trainset = torchvision.datasets.CIFAR10(root='./data', train=True, download=False, transform=transform_train)
     train_sampler = DistributedSampler(trainset, num_replicas=world_size, rank=rank)
     trainloader = torch.utils.data.DataLoader(trainset, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY, sampler=train_sampler)
 
