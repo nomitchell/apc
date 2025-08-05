@@ -8,6 +8,7 @@ import torchattacks
 from tqdm import tqdm
 import os
 import torch.distributed as dist
+import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
 
@@ -26,10 +27,12 @@ NUM_WORKERS = 4
 PIN_MEMORY = True
 CHECKPOINT_DIR = 'apc_project/checkpoints'
 
-def setup_ddp():
+def setup_ddp(rank, world_size):
     """Initializes the distributed process group."""
-    dist.init_process_group(backend="nccl")
-    torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+    os.environ['MASTER_ADDR'] = 'localhost'
+    os.environ['MASTER_PORT'] = '12355'
+    dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
+    torch.cuda.set_device(rank)
 
 def cleanup_ddp():
     """Cleans up the distributed process group."""
@@ -161,6 +164,7 @@ class ComposedModel(nn.Module):
         return self.classifier(self.purifier(x))
 
 def main(rank, world_size):
+    setup_ddp(rank, world_size)
     print(f"==> Starting process {rank}/{world_size}..")
     # Data
     print(f"==> [{rank}] Preparing data..")
@@ -266,12 +270,14 @@ def main(rank, world_size):
         torch.save(purifier.module.state_dict(), os.path.join(CHECKPOINT_DIR, 'purifier_final.pth'))
         torch.save(classifier.module.state_dict(), os.path.join(CHECKPOINT_DIR, 'classifier_final.pth'))
         print("Training finished.")
+    
+    cleanup_ddp()
 
 if __name__ == '__main__':
-    setup_ddp()
-    rank = int(os.environ["RANK"])
-    world_size = int(os.environ["WORLD_SIZE"])
-    if rank == 0 and not os.path.exists(CHECKPOINT_DIR):
+    world_size = 4
+    if not os.path.exists(CHECKPOINT_DIR):
         os.makedirs(CHECKPOINT_DIR)
-    main(rank, world_size)
-    cleanup_ddp()
+    mp.spawn(main,
+             args=(world_size,),
+             nprocs=world_size,
+             join=True)
