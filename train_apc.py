@@ -146,7 +146,7 @@ class WideResNet(nn.Module):
         out = self.layer1(out)
         out = self.layer2(out)
         out = self.layer3(out)
-        out = self.relu(self.bn1(out))
+        out = self.relu(self.bn1(out).clone())
         out = F.avg_pool2d(out, 8)
         out = out.view(out.size(0), -1)
         out = self.linear(out)
@@ -166,7 +166,6 @@ class ComposedModel(nn.Module):
         return self.classifier(self.purifier(x))
 
 def main(rank, world_size):
-    torch.autograd.set_detect_anomaly(True)
     setup_ddp(rank, world_size)
     print(f"==> Starting process {rank}/{world_size}..")
     # Data
