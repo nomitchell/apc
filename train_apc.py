@@ -98,6 +98,7 @@ class WideBasic(nn.Module):
         self.dropout = nn.Dropout(p=dropout_rate)
         self.bn2 = nn.BatchNorm2d(planes)
         self.conv2 = nn.Conv2d(planes, planes, kernel_size=3, stride=stride, padding=1, bias=True)
+        self.relu = nn.ReLU(inplace=False)
 
         self.shortcut = nn.Sequential()
         if stride != 1 or in_planes != planes:
@@ -106,8 +107,8 @@ class WideBasic(nn.Module):
             )
 
     def forward(self, x):
-        out = self.dropout(self.conv1(F.relu(self.bn1(x))))
-        out = self.conv2(F.relu(self.bn2(out)))
+        out = self.dropout(self.conv1(self.relu(self.bn1(x))))
+        out = self.conv2(self.relu(self.bn2(out)))
         out = out + self.shortcut(x)
         return out
 
