@@ -10,6 +10,7 @@ import torchattacks
 from tqdm import tqdm
 import os
 import argparse
+from torch.cuda.amp import GradScaler, autocast
 
 from models import PurifierUNet, WideResNet34_10, ComposedModel
 
@@ -79,6 +80,9 @@ def main():
     composed_model = ComposedModel(purifier, classifier)
     atk = torchattacks.PGD(composed_model, eps=ADV_EPSILON, alpha=ADV_ALPHA, steps=ADV_STEPS, random_start=True)
 
+    # --- AMP Scaler ---
+    scaler = GradScaler()
+
     # --- Training Loop ---
     print("==> Starting Training..")
     for epoch in range(args.epochs):
@@ -94,25 +98,33 @@ def main():
         for i, (images, labels) in enumerate(pbar):
             images, labels = images.to(DEVICE), labels.to(DEVICE)
             
-            adv_images = atk(images, labels)
             optimizer.zero_grad()
 
-            purified_clean = purifier(images)
-            purified_adv = purifier(adv_images)
-            logits_clean = classifier(purified_clean)
-            logits_adv = classifier(purified_adv)
+            with autocast():
+                adv_images = atk(images, labels)
+                purified_clean = purifier(images)
+                purified_adv = purifier(adv_images)
 
-            loss_ce = criterion_ce(logits_clean, labels)
-            loss_recon = criterion_l1(purified_adv, images)
-            loss_robust = criterion_kl(
-                F.log_softmax(logits_adv, dim=1),
-                F.softmax(logits_clean.detach(), dim=1)
-            )
-            
-            total_loss = loss_ce + LOSS_BETA * loss_recon + LOSS_GAMMA * loss_robust
+                if i % 50 == 0:
+                    torchvision.utils.save_image(images, 'debug_clean.png', normalize=True)
+                    torchvision.utils.save_image(adv_images, 'debug_adversarial.png', normalize=True)
+                    torchvision.utils.save_image(purified_adv, 'debug_purified_adversarial.png', normalize=True)
 
-            total_loss.backward()
-            optimizer.step()
+                logits_clean = classifier(purified_clean)
+                logits_adv = classifier(purified_adv)
+
+                loss_ce = criterion_ce(logits_clean, labels)
+                loss_recon = criterion_l1(purified_adv, images)
+                loss_robust = criterion_kl(
+                    F.log_softmax(logits_adv, dim=1),
+                    F.softmax(logits_clean.detach(), dim=1)
+                )
+                
+                total_loss = loss_ce + LOSS_BETA * loss_recon + LOSS_GAMMA * loss_robust
+
+            scaler.scale(total_loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
 
             running_loss += total_loss.item()
             
