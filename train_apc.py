@@ -113,7 +113,7 @@ class WideBasic(nn.Module):
         out = self.bn1(x).clone()
         out = self.relu(out)
         out = self.conv1(out)
-        out = self.bn2(out).clone()
+        out = self.bn2(out).contiguous().clone()
         out = self.relu(out)
         out = self.conv2(out)
         return out
