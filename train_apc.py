@@ -49,7 +49,10 @@ class ConvBlock(nn.Module):
             nn.ReLU(inplace=False)
         )
     def forward(self, x):
-        return self.conv(x)
+        out = self.conv[0](x)
+        out = self.conv[1](out).clone() # Clone after BatchNorm2d
+        out = self.conv[2](out)
+        return out
 
 class PurifierUNet(nn.Module):
     def __init__(self):
@@ -107,9 +110,12 @@ class WideBasic(nn.Module):
             )
 
     def forward(self, x):
-        out = self.dropout(self.conv1(self.relu(self.bn1(x).clone())))
-        out = self.conv2(self.relu(self.bn2(out).clone()))
-        out = out + self.shortcut(x)
+        out = self.bn1(x).clone()
+        out = self.relu(out)
+        out = self.conv1(out)
+        out = self.bn2(out).clone()
+        out = self.relu(out)
+        out = self.conv2(out)
         return out
 
 class WideResNet(nn.Module):
