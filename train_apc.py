@@ -18,7 +18,7 @@ def main():
     # --- Argument Parser for flexibility ---
     parser = argparse.ArgumentParser(description='APC Training')
     parser.add_argument('--epochs', default=120, type=int, help='number of total epochs to run')
-    parser.add_argument('--batch_size', default=128, type=int, help='mini-batch size')
+    parser.add_argument('--batch_size', default=1024, type=int, help='mini-batch size')
     parser.add_argument('--lr', default=0.1, type=float, help='initial learning rate')
     parser.add_argument('--checkpoint_path', default='./checkpoints', type=str, help='path to save checkpoints')
     args = parser.parse_args()
