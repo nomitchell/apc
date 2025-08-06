@@ -166,6 +166,7 @@ class ComposedModel(nn.Module):
         return self.classifier(self.purifier(x))
 
 def main(rank, world_size):
+    torch.autograd.set_detect_anomaly(True)
     setup_ddp(rank, world_size)
     print(f"==> Starting process {rank}/{world_size}..")
     # Data
