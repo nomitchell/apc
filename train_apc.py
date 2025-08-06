@@ -128,6 +128,7 @@ class WideResNet(nn.Module):
         self.layer2 = self._wide_layer(WideBasic, nStages[2], n, dropout_rate, stride=2)
         self.layer3 = self._wide_layer(WideBasic, nStages[3], n, dropout_rate, stride=2)
         self.bn1 = nn.BatchNorm2d(nStages[3], momentum=0.9)
+        self.relu = nn.ReLU(inplace=False)
         self.linear = nn.Linear(nStages[3], num_classes)
 
     def _wide_layer(self, block, planes, num_blocks, dropout_rate, stride):
@@ -145,7 +146,7 @@ class WideResNet(nn.Module):
         out = self.layer1(out)
         out = self.layer2(out)
         out = self.layer3(out)
-        out = F.relu(self.bn1(out))
+        out = self.relu(self.bn1(out))
         out = F.avg_pool2d(out, 8)
         out = out.view(out.size(0), -1)
         out = self.linear(out)
