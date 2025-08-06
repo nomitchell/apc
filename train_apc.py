@@ -1,3 +1,5 @@
+# /apc_project/train_apc.py
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -7,286 +9,135 @@ import torchvision.transforms as transforms
 import torchattacks
 from tqdm import tqdm
 import os
-import torch.distributed as dist
-import torch.multiprocessing as mp
-from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data.distributed import DistributedSampler
+import argparse
 
-# --- Hyperparameters ---
-EPOCHS = 120
-LEARNING_RATE = 0.1
-WEIGHT_DECAY = 5e-4
-MOMENTUM = 0.9
-LOSS_BETA = 0.25
-LOSS_GAMMA = 6.0
-ADV_EPSILON = 8/255
-ADV_ALPHA = 2/255
-ADV_STEPS = 10
-BATCH_SIZE = 128  # This will be per-GPU
-NUM_WORKERS = 4
-PIN_MEMORY = True
-CHECKPOINT_DIR = 'apc_project/checkpoints'
+from models import PurifierUNet, WideResNet34_10, ComposedModel
 
-def setup_ddp(rank, world_size):
-    """Initializes the distributed process group."""
-    os.environ['MASTER_ADDR'] = 'localhost'
-    os.environ['MASTER_PORT'] = '12355'
-    dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
-    torch.cuda.set_device(rank)
+def main():
+    # --- Argument Parser for flexibility ---
+    parser = argparse.ArgumentParser(description='APC Training')
+    parser.add_argument('--epochs', default=120, type=int, help='number of total epochs to run')
+    parser.add_argument('--batch_size', default=128, type=int, help='mini-batch size')
+    parser.add_argument('--lr', default=0.1, type=float, help='initial learning rate')
+    parser.add_argument('--checkpoint_path', default='./checkpoints', type=str, help='path to save checkpoints')
+    args = parser.parse_args()
 
-def cleanup_ddp():
-    """Cleans up the distributed process group."""
-    dist.destroy_process_group()
+    # --- Hyperparameters ---
+    DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+    WEIGHT_DECAY = 5e-4
+    MOMENTUM = 0.9
+    LOSS_BETA = 0.25
+    LOSS_GAMMA = 6.0
+    ADV_EPSILON = 8 / 255
+    ADV_ALPHA = 2 / 255
+    ADV_STEPS = 10
+    
+    # --- Setup ---
+    print(f"Using device: {DEVICE}")
+    os.makedirs(args.checkpoint_path, exist_ok=True)
 
-# --- Model Architectures ---
-
-class ConvBlock(nn.Module):
-    def __init__(self, in_channels, out_channels):
-        super(ConvBlock, self).__init__()
-        self.conv = nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=False)
-        )
-    def forward(self, x):
-        out = self.conv[0](x)
-        out = self.conv[1](out).clone() # Clone after BatchNorm2d
-        out = self.conv[2](out)
-        return out
-
-class PurifierUNet(nn.Module):
-    def __init__(self):
-        super(PurifierUNet, self).__init__()
-        self.enc1_1 = ConvBlock(3, 64)
-        self.enc1_2 = ConvBlock(64, 64)
-        self.pool1 = nn.MaxPool2d(2)
-
-        self.enc2_1 = ConvBlock(64, 128)
-        self.enc2_2 = ConvBlock(128, 128)
-        self.pool2 = nn.MaxPool2d(2)
-
-        self.enc3_1 = ConvBlock(128, 256)
-        self.enc3_2 = ConvBlock(256, 256)
-
-        self.upconv2 = nn.ConvTranspose2d(256, 128, kernel_size=2, stride=2)
-        self.dec2_1 = ConvBlock(256, 128)
-        self.dec2_2 = ConvBlock(128, 128)
-
-        self.upconv1 = nn.ConvTranspose2d(128, 64, kernel_size=2, stride=2)
-        self.dec1_1 = ConvBlock(128, 64)
-        self.dec1_2 = ConvBlock(64, 64)
-
-        self.final_conv = nn.Conv2d(64, 3, kernel_size=1)
-
-    def forward(self, x):
-        enc1 = self.enc1_2(self.enc1_1(x))
-        enc2 = self.enc2_2(self.enc2_1(self.pool1(enc1)))
-        enc3 = self.enc3_2(self.enc3_1(self.pool2(enc2)))
-
-        dec2 = self.upconv2(enc3)
-        dec2 = torch.cat((dec2, enc2), dim=1)
-        dec2 = self.dec2_2(self.dec2_1(dec2))
-
-        dec1 = self.upconv1(dec2)
-        dec1 = torch.cat((dec1, enc1), dim=1)
-        dec1 = self.dec1_2(self.dec1_1(dec1))
-
-        return self.final_conv(dec1)
-
-class WideBasic(nn.Module):
-    def __init__(self, in_planes, planes, dropout_rate, stride=1):
-        super(WideBasic, self).__init__()
-        self.bn1 = nn.BatchNorm2d(in_planes)
-        self.conv1 = nn.Conv2d(in_planes, planes, kernel_size=3, padding=1, bias=True)
-        self.dropout = nn.Dropout(p=dropout_rate)
-        self.bn2 = nn.BatchNorm2d(planes)
-        self.conv2 = nn.Conv2d(planes, planes, kernel_size=3, stride=stride, padding=1, bias=True)
-        self.relu = nn.ReLU(inplace=False)
-
-        self.shortcut = nn.Sequential()
-        if stride != 1 or in_planes != planes:
-            self.shortcut = nn.Sequential(
-                nn.Conv2d(in_planes, planes, kernel_size=1, stride=stride, bias=True),
-            )
-
-    def forward(self, x):
-        out = self.bn1(x).clone()
-        out = self.relu(out)
-        out = self.conv1(out)
-        out = self.bn2(out).contiguous().clone()
-        out = self.relu(out)
-        out = self.conv2(out)
-        return out
-
-class WideResNet(nn.Module):
-    def __init__(self, depth, widen_factor, dropout_rate, num_classes):
-        super(WideResNet, self).__init__()
-        self.in_planes = 16
-
-        assert ((depth - 4) % 6 == 0), 'Wide-resnet depth should be 6n+4'
-        n = (depth - 4) / 6
-        k = widen_factor
-
-        nStages = [16, 16 * k, 32 * k, 64 * k]
-
-        self.conv1 = nn.Conv2d(3, nStages[0], kernel_size=3, stride=1, padding=1, bias=True)
-        self.layer1 = self._wide_layer(WideBasic, nStages[1], n, dropout_rate, stride=1)
-        self.layer2 = self._wide_layer(WideBasic, nStages[2], n, dropout_rate, stride=2)
-        self.layer3 = self._wide_layer(WideBasic, nStages[3], n, dropout_rate, stride=2)
-        self.bn1 = nn.Identity()
-        self.relu = nn.ReLU(inplace=False)
-        self.linear = nn.Linear(nStages[3], num_classes)
-
-    def _wide_layer(self, block, planes, num_blocks, dropout_rate, stride):
-        strides = [stride] + [1] * (int(num_blocks) - 1)
-        layers = []
-
-        for stride in strides:
-            layers.append(block(self.in_planes, planes, dropout_rate, stride))
-            self.in_planes = planes
-
-        return nn.Sequential(*layers)
-
-    def forward(self, x):
-        out = self.conv1(x)
-        out = self.layer1(out)
-        out = self.layer2(out)
-        out = self.layer3(out).clone()
-        out = self.relu(self.bn1(out))
-        out = F.avg_pool2d(out, 8)
-        out = out.view(out.size(0), -1)
-        out = self.linear(out)
-
-        return out
-
-def WideResNet34_10(num_classes=10, dropout_rate=0.3):
-    return WideResNet(34, 10, dropout_rate, num_classes)
-
-class ComposedModel(nn.Module):
-    def __init__(self, purifier, classifier):
-        super().__init__()
-        self.purifier = purifier
-        self.classifier = classifier
-
-    def forward(self, x):
-        return self.classifier(self.purifier(x))
-
-def main(rank, world_size):
-    torch.autograd.set_detect_anomaly(True)
-    setup_ddp(rank, world_size)
-    print(f"==> Starting process {rank}/{world_size}..")
-    # Data
-    print(f"==> [{rank}] Preparing data..")
+    # --- Data Handling ---
+    print("==> Preparing data..")
     transform_train = transforms.Compose([
         transforms.RandomCrop(32, padding=4),
         transforms.RandomHorizontalFlip(),
         transforms.ToTensor(),
         transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
     ])
-    trainset = torchvision.datasets.CIFAR10(root='./data', train=True, download=False, transform=transform_train)
-    train_sampler = DistributedSampler(trainset, num_replicas=world_size, rank=rank)
-    trainloader = torch.utils.data.DataLoader(trainset, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY, sampler=train_sampler)
+    trainset = torchvision.datasets.CIFAR10(root='./data', train=True, download=True, transform=transform_train)
+    train_loader = torch.utils.data.DataLoader(trainset, batch_size=args.batch_size, shuffle=True, num_workers=4, pin_memory=True)
 
-    # Models
-    print(f"==> [{rank}] Building models..")
-    purifier = PurifierUNet().to(rank)
-    classifier = WideResNet34_10().to(rank)
-    purifier = DDP(purifier, device_ids=[rank])
-    classifier = DDP(classifier, device_ids=[rank])
+    # --- Models, Optimizer, Scheduler ---
+    print("==> Building models..")
+    purifier = PurifierUNet()
+    classifier = WideResNet34_10()
 
-    # Optimizer and Scheduler
+    # --- Multi-GPU Support (DataParallel) ---
+    purifier = purifier.to(DEVICE)
+    classifier = classifier.to(DEVICE)
+    n_gpu = torch.cuda.device_count()
+    if DEVICE == 'cuda' and n_gpu > 1:
+        print(f"Using {n_gpu} GPUs!")
+        purifier = nn.DataParallel(purifier)
+        classifier = nn.DataParallel(classifier)
+
     optimizer = optim.SGD(
         list(purifier.parameters()) + list(classifier.parameters()),
-        lr=LEARNING_RATE * world_size,  # Scale learning rate
+        lr=args.lr,
         momentum=MOMENTUM,
         weight_decay=WEIGHT_DECAY
     )
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
 
-    # Training loop
-    for epoch in range(EPOCHS):
-        train_sampler.set_epoch(epoch) # Important for shuffling
-        if rank == 0:
-            print(f"\nEpoch: {epoch+1}/{EPOCHS}")
+    criterion_ce = nn.CrossEntropyLoss()
+    criterion_l1 = nn.L1Loss()
+    criterion_kl = nn.KLDivLoss(reduction='batchmean')
+
+    # --- Training Loop ---
+    print("==> Starting Training..")
+    for epoch in range(args.epochs):
         purifier.train()
         classifier.train()
         
-        train_loss = 0
-        train_loss_ce_acc = 0
-        train_loss_recon_acc = 0
-        train_loss_robust_acc = 0
-        correct = 0
-        total = 0
+        running_loss = 0.0
+        running_robust_correct = 0
+        total_train_samples = 0
+        
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}")
+        
+        for i, (images, labels) in enumerate(pbar):
+            images, labels = images.to(DEVICE), labels.to(DEVICE)
 
-        progress_bar = tqdm(trainloader, desc=f'Epoch {epoch+1}', disable=(rank != 0))
-
-        for batch_idx, (images, labels) in enumerate(progress_bar):
-            images, labels = images.to(rank), labels.to(rank)
-
-            # Note: DDP handles model wrapping, no need to re-wrap in loop
-            composed_model = ComposedModel(purifier.module, classifier.module)
-            atk = torchattacks.PGD(composed_model, eps=ADV_EPSILON, alpha=ADV_ALPHA, steps=ADV_STEPS)
-
-            adv_images = atk(images.clone(), labels)
-
+            composed_model = ComposedModel(purifier, classifier)
+            atk = torchattacks.PGD(composed_model, eps=ADV_EPSILON, alpha=ADV_ALPHA, steps=ADV_STEPS, random_start=True)
+            
+            adv_images = atk(images, labels)
             optimizer.zero_grad()
 
-            purified_clean = purifier(images).clone()
-            purified_adv = purifier(adv_images).clone()
+            purified_clean = purifier(images)
+            purified_adv = purifier(adv_images)
             logits_clean = classifier(purified_clean)
             logits_adv = classifier(purified_adv)
 
-            loss_ce = F.cross_entropy(logits_clean, labels)
-            loss_recon = F.l1_loss(purified_adv, images)
-            loss_robust = F.kl_div(
+            loss_ce = criterion_ce(logits_clean, labels)
+            loss_recon = criterion_l1(purified_adv, images)
+            loss_robust = criterion_kl(
                 F.log_softmax(logits_adv, dim=1),
-                F.softmax(logits_clean.detach(), dim=1),
-                reduction='batchmean'
+                F.softmax(logits_clean.detach(), dim=1)
             )
-
+            
             total_loss = loss_ce + LOSS_BETA * loss_recon + LOSS_GAMMA * loss_robust
 
             total_loss.backward()
             optimizer.step()
 
-            # Metrics are only tracked on rank 0 for simplicity
-            if rank == 0:
-                train_loss += total_loss.item()
-                train_loss_ce_acc += loss_ce.item()
-                train_loss_recon_acc += loss_recon.item()
-                train_loss_robust_acc += loss_robust.item()
-                _, predicted = logits_clean.max(1)
-                total += labels.size(0)
-                correct += predicted.eq(labels).sum().item()
+            running_loss += total_loss.item()
+            
+            _, predicted_adv = logits_adv.max(1)
+            total_train_samples += labels.size(0)
+            running_robust_correct += predicted_adv.eq(labels).sum().item()
 
-                progress_bar.set_postfix({
-                    'Loss': f'{train_loss/(batch_idx+1):.3f}',
-                    'CE': f'{train_loss_ce_acc/(batch_idx+1):.3f}',
-                    'Recon': f'{train_loss_recon_acc/(batch_idx+1):.3f}',
-                    'Robust': f'{train_loss_robust_acc/(batch_idx+1):.3f}',
-                    'Acc': f'{100.*correct/total:.3f}% ({correct}/{total})'
-                })
+            pbar.set_postfix({
+                'Loss': f'{total_loss.item():.4f}',
+                'CE': f'{loss_ce.item():.4f}',
+                'Recon': f'{loss_recon.item():.4f}',
+                'Robust': f'{loss_robust.item():.4f}'
+            })
 
         scheduler.step()
+        
+        epoch_loss = running_loss / len(train_loader)
+        robust_acc = 100. * running_robust_correct / total_train_samples
+        print(f"\nEpoch {epoch+1} Summary: Avg Loss: {epoch_loss:.4f}, Robust Acc: {robust_acc:.2f}%, LR: {scheduler.get_last_lr()[0]:.5f}")
 
-        if rank == 0 and (epoch + 1) % 20 == 0:
-            print("==> Saving checkpoint..")
-            torch.save(purifier.module.state_dict(), os.path.join(CHECKPOINT_DIR, f'purifier_epoch_{epoch+1}.pth'))
-            torch.save(classifier.module.state_dict(), os.path.join(CHECKPOINT_DIR, f'classifier_epoch_{epoch+1}.pth'))
-
-    if rank == 0:
-        print("==> Saving final models..")
-        torch.save(purifier.module.state_dict(), os.path.join(CHECKPOINT_DIR, 'purifier_final.pth'))
-        torch.save(classifier.module.state_dict(), os.path.join(CHECKPOINT_DIR, 'classifier_final.pth'))
-        print("Training finished.")
+        if (epoch + 1) % 20 == 0 or (epoch + 1) == args.epochs:
+            print(f"Saving checkpoint at epoch {epoch+1}...")
+            purifier_state = purifier.module.state_dict() if n_gpu > 1 else purifier.state_dict()
+            classifier_state = classifier.module.state_dict() if n_gpu > 1 else classifier.state_dict()
+            torch.save(purifier_state, os.path.join(args.checkpoint_path, f'purifier_epoch_{epoch+1}.pth'))
+            torch.save(classifier_state, os.path.join(args.checkpoint_path, f'classifier_epoch_{epoch+1}.pth'))
     
-    cleanup_ddp()
+    print("Training finished.")
 
 if __name__ == '__main__':
-    world_size = 4
-    if not os.path.exists(CHECKPOINT_DIR):
-        os.makedirs(CHECKPOINT_DIR)
-    mp.spawn(main,
-             args=(world_size,),
-             nprocs=world_size,
-             join=True)
+    main()
