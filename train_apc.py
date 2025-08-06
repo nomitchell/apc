@@ -34,6 +34,8 @@ def main():
     
     # --- Setup ---
     print(f"Using device: {DEVICE}")
+    if DEVICE == 'cuda':
+        torch.backends.cudnn.benchmark = True
     os.makedirs(args.checkpoint_path, exist_ok=True)
 
     # --- Data Handling ---
@@ -73,6 +75,10 @@ def main():
     criterion_l1 = nn.L1Loss()
     criterion_kl = nn.KLDivLoss(reduction='batchmean')
 
+    # --- Attacker Setup ---
+    composed_model = ComposedModel(purifier, classifier)
+    atk = torchattacks.PGD(composed_model, eps=ADV_EPSILON, alpha=ADV_ALPHA, steps=ADV_STEPS, random_start=True)
+
     # --- Training Loop ---
     print("==> Starting Training..")
     for epoch in range(args.epochs):
@@ -87,9 +93,6 @@ def main():
         
         for i, (images, labels) in enumerate(pbar):
             images, labels = images.to(DEVICE), labels.to(DEVICE)
-
-            composed_model = ComposedModel(purifier, classifier)
-            atk = torchattacks.PGD(composed_model, eps=ADV_EPSILON, alpha=ADV_ALPHA, steps=ADV_STEPS, random_start=True)
             
             adv_images = atk(images, labels)
             optimizer.zero_grad()
