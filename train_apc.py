@@ -166,6 +166,7 @@ class ComposedModel(nn.Module):
         return self.classifier(self.purifier(x))
 
 def main(rank, world_size):
+    torch.autograd.set_detect_anomaly(True)
     setup_ddp(rank, world_size)
     print(f"==> Starting process {rank}/{world_size}..")
     # Data
@@ -220,12 +221,12 @@ def main(rank, world_size):
             composed_model = ComposedModel(purifier.module, classifier.module)
             atk = torchattacks.PGD(composed_model, eps=ADV_EPSILON, alpha=ADV_ALPHA, steps=ADV_STEPS)
 
-            adv_images = atk(images, labels)
+            adv_images = atk(images.clone(), labels)
 
             optimizer.zero_grad()
 
-            purified_clean = purifier(images)
-            purified_adv = purifier(adv_images)
+            purified_clean = purifier(images).clone()
+            purified_adv = purifier(adv_images).clone()
             logits_clean = classifier(purified_clean)
             logits_adv = classifier(purified_adv)
 
